@@ -50,7 +50,10 @@ RUN printf 'UpdateMethod=docker\nBranch=%s\nPackageVersion=%s\nPackageAuthor=[ch
 
 # ---- Stage 2: extra libs (icu + sqlite + tzdata + certs) --------------------
 FROM debian:bookworm-slim AS libs
-RUN apt-get update \
+# Create TMPDIR before apt-get — ca-certificates post-install uses mktemp which
+# inherits TMPDIR from ENV; the dir must exist before dpkg runs.
+RUN mkdir -p /run/prowlarr-temp \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         libicu72 \
         libsqlite3-0 \

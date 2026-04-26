@@ -54,7 +54,10 @@ ENV COMPlus_EnableDiagnostics=0 \
     TMPDIR=/run/prowlarr-temp \
     TZ=UTC
 
-RUN apt-get update \
+# Create TMPDIR first — ca-certificates post-install runs mktemp which inherits
+# TMPDIR from ENV. If the dir doesn't exist yet, dpkg fails with exit 100.
+RUN mkdir -p /run/prowlarr-temp \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         libicu72 \
         libsqlite3-0 \
@@ -64,7 +67,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 13000 prowlarr \
     && useradd -u 13001 -g prowlarr -d /config -s /usr/sbin/nologin -M prowlarr \
-    && mkdir -p /config /app /run/prowlarr-temp \
+    && mkdir -p /config /app \
     && chown -R prowlarr:prowlarr /config /app /run/prowlarr-temp
 
 COPY --from=fetch --chown=prowlarr:prowlarr /work/prowlarr /app/prowlarr/bin
