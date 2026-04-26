@@ -1,0 +1,79 @@
+# Dockerfile.debian — debian:bookworm-slim comparison variant.
+#
+# Uses the glibc (linux-core-x64) Prowlarr tarball instead of the musl one.
+# Expected to be LARGER than the Alpine primary (same result as sonarr-alpine
+# iter-2: +30-35% vs Alpine). Included for completeness per the 3-base mandate.
+#
+# NOTE: Pin bookworm-slim, NOT debian:stable-slim. debian:stable-slim rolled to
+# trixie (libicu76) around 2026-04-25 which breaks apt-install of libicu72.
+# debian:bookworm-slim is reproducible for the foreseeable future.
+
+ARG PROWLARR_VERSION=2.3.5.5327
+ARG PROWLARR_BRANCH=master
+
+# ---- Stage 1: fetch & unpack -----------------------------------------------
+FROM debian:bookworm-slim AS fetch
+ARG PROWLARR_VERSION
+ARG PROWLARR_BRANCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl tar \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+
+# Use the glibc (linux-core-x64) tarball — not the musl one — on Debian.
+RUN curl -fsSL \
+    "https://prowlarr.servarr.com/v1/update/${PROWLARR_BRANCH}/updatefile?version=${PROWLARR_VERSION}&os=linux&runtime=netcore&arch=x64" \
+    -o /work/prowlarr.tar.gz \
+  && mkdir -p /work/prowlarr \
+  && tar xzf /work/prowlarr.tar.gz -C /work/prowlarr --strip-components=1 \
+  && rm /work/prowlarr.tar.gz
+
+RUN set -eux; \
+    cd /work/prowlarr; \
+    rm -rf Prowlarr.Update; \
+    find . -name '*.pdb' -type f -delete; \
+    rm -f UI/*.map; \
+    rm -f ServiceInstall ServiceUninstall; \
+    rm -f createdump
+
+ARG PROWLARR_VERSION
+ARG PROWLARR_BRANCH
+RUN printf 'UpdateMethod=docker\nBranch=%s\nPackageVersion=%s\nPackageAuthor=[chefcai/prowlarr-alpine](https://github.com/chefcai/prowlarr-alpine)\n' \
+    "${PROWLARR_BRANCH}" "${PROWLARR_VERSION}" \
+    > /work/prowlarr/package_info
+
+# ---- Stage 2: runtime -------------------------------------------------------
+FROM debian:bookworm-slim
+ARG PROWLARR_VERSION
+LABEL org.opencontainers.image.title="prowlarr-alpine (debian variant)"
+LABEL org.opencontainers.image.source="https://github.com/chefcai/prowlarr-alpine"
+LABEL org.opencontainers.image.version="${PROWLARR_VERSION}"
+
+ENV COMPlus_EnableDiagnostics=0 \
+    XDG_CONFIG_HOME=/config/xdg \
+    TMPDIR=/run/prowlarr-temp \
+    TZ=UTC
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libicu72 \
+        libsqlite3-0 \
+        tzdata \
+        ca-certificates \
+        wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 13000 prowlarr \
+    && useradd -u 13001 -g prowlarr -d /config -s /usr/sbin/nologin -M prowlarr \
+    && mkdir -p /config /app /run/prowlarr-temp \
+    && chown -R prowlarr:prowlarr /config /app /run/prowlarr-temp
+
+COPY --from=fetch --chown=prowlarr:prowlarr /work/prowlarr /app/prowlarr/bin
+
+USER prowlarr
+WORKDIR /app/prowlarr/bin
+EXPOSE 9696
+
+HEALTHCHECK --interval=1m30s --timeout=10s --retries=3 --start-period=60s \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:9696/ping || exit 1
+
+CMD ["./Prowlarr", "--data=/config", "--nobrowser"]

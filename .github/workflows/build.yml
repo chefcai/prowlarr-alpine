@@ -1,0 +1,227 @@
+name: Build and Push prowlarr-alpine Image
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: 'Which Dockerfile to build'
+        type: choice
+        required: false
+        default: 'Dockerfile'
+        options:
+          - Dockerfile
+          - Dockerfile.debian
+          - Dockerfile.distroless
+      tag_suffix:
+        description: 'Optional suffix appended to the version tag (e.g. "iter2-debian"). When set, :latest is NOT updated.'
+        type: string
+        required: false
+        default: ''
+      measure_baseline:
+        description: 'Skip the build, just measure lscr.io/linuxserver/prowlarr:latest baseline.'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # Daily at 07:30 UTC. Staggered after sonarr-alpine (07:00) in the suite:
+    # bazarr 06:00 / jellyfin 06:15 / ttyd 06:30 / seerr 06:45 / sonarr 07:00
+    # prowlarr 07:30
+    - cron: '30 7 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Serialize runs on this ref to prevent the parallel-push :latest race (two
+# back-to-back pushes can race; the slower-finishing run wins :latest with stale
+# bits). Cancel the in-flight run when a newer one is queued.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Optional: measure upstream baseline (workflow_dispatch only)
+  # ---------------------------------------------------------------------------
+  baseline:
+    name: Measure upstream linuxserver/prowlarr:latest (iter-0 baseline)
+    if: github.event_name == 'workflow_dispatch' && inputs.measure_baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull manifest and report compressed size for lscr.io/linuxserver/prowlarr:latest
+        run: |
+          PKG="linuxserver/prowlarr"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${PKG}:pull" | jq -r .token)
+          INDEX=$(curl -sSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://ghcr.io/v2/${PKG}/manifests/latest")
+          AMD64_DIGEST=$(echo "$INDEX" | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' | head -1)
+          if [ -z "$AMD64_DIGEST" ] || [ "$AMD64_DIGEST" = "null" ]; then
+            MANIFEST="$INDEX"
+          else
+            MANIFEST=$(curl -sSL \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${PKG}/manifests/${AMD64_DIGEST}")
+          fi
+          COMPRESSED=$(echo "$MANIFEST" | jq '[.layers[].size] | add')
+          COMPRESSED_MB=$(echo "scale=1; $COMPRESSED / 1024 / 1024" | bc)
+          LAYERS=$(echo "$MANIFEST" | jq '.layers | length')
+          echo "::notice::lscr.io/linuxserver/prowlarr:latest (linux/amd64) compressed = ${COMPRESSED_MB} MB across ${LAYERS} layers"
+          echo "## iter-0 baseline" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`lscr.io/linuxserver/prowlarr:latest\` (linux/amd64)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Compressed size: **${COMPRESSED_MB} MB** across ${LAYERS} layers" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Manifest digest: \`${AMD64_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Layer breakdown" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$MANIFEST" | jq -r '.layers[] | "\(.size / 1024 / 1024 * 10 | floor / 10) MB \(.digest[7:19]) \(.mediaType)"' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Main: build and push
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build prowlarr-alpine
+    if: github.event_name != 'workflow_dispatch' || !inputs.measure_baseline
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Prowlarr master version from prowlarr.servarr.com
+        id: prowlarr_version
+        run: |
+          VERSION=$(curl -fsSL \
+            "https://prowlarr.servarr.com/v1/update/master/changes?os=linuxmusl&runtime=netcore&arch=x64" \
+            | jq -r '.[0].version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Could not resolve Prowlarr master version"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Prowlarr master: $VERSION"
+
+      - name: Determine which Dockerfile + tag suffix
+        id: variant
+        run: |
+          DF="${{ inputs.dockerfile }}"
+          [ -z "$DF" ] && DF="Dockerfile"
+          SUFFIX="${{ inputs.tag_suffix }}"
+          # workflow_dispatch with a tag_suffix: publish only :<version>-<suffix>,
+          # do NOT touch :latest — so iter-2/iter-3 measurements don't overwrite
+          # the production tag.
+          if [ -n "$SUFFIX" ]; then
+            VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}-${SUFFIX}"
+            UPDATE_LATEST="false"
+          else
+            VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}"
+            UPDATE_LATEST="true"
+          fi
+          echo "dockerfile=$DF"           >> "$GITHUB_OUTPUT"
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+          echo "update_latest=$UPDATE_LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image already exists for this version+variant
+        id: check
+        run: |
+          TAG="${{ steps.variant.outputs.version_tag }}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
+          HTTP=$(curl -sSL -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG")
+          if [ "$HTTP" = "200" ]; then
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag $TAG already exists — skipping build."
+          else
+            echo "needs_build=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag $TAG not yet published (HTTP $HTTP) — will build."
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose docker tags
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        id: tags
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.variant.outputs.version_tag }}"
+          if [ "${{ steps.variant.outputs.update_latest }}" = "true" ]; then
+            TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Tags to push: $TAGS"
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ steps.variant.outputs.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            PROWLARR_VERSION=${{ steps.prowlarr_version.outputs.version }}
+            PROWLARR_BRANCH=master
+          # Per-variant cache scope — iter-1/iter-2/iter-3 must not poison each
+          # other's BuildKit cache.
+          cache-from: type=gha,scope=${{ steps.variant.outputs.dockerfile }}
+          cache-to:   type=gha,mode=max,scope=${{ steps.variant.outputs.dockerfile }}
+
+      - name: Report final image size
+        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        run: |
+          TAG="${{ steps.variant.outputs.version_tag }}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
+          INDEX=$(curl -sSL \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG")
+          MEDIA=$(echo "$INDEX" | jq -r '.mediaType // empty')
+          if echo "$MEDIA" | grep -qE 'image\.index|manifest\.list'; then
+            AMD64=$(echo "$INDEX" | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' | head -1)
+            MANIFEST=$(curl -sSL \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${{ github.repository }}/manifests/$AMD64")
+          else
+            MANIFEST="$INDEX"
+          fi
+          COMPRESSED=$(echo "$MANIFEST" | jq '[.layers[].size] | add')
+          COMPRESSED_MB=$(echo "scale=1; $COMPRESSED / 1024 / 1024" | bc)
+          LAYERS=$(echo "$MANIFEST" | jq '.layers | length')
+          echo "::notice::prowlarr-alpine $TAG compressed = ${COMPRESSED_MB} MB across ${LAYERS} layers"
+          echo "## Image Size" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Dockerfile: \`${{ steps.variant.outputs.dockerfile }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Compressed (linux/amd64): **${COMPRESSED_MB} MB** across ${LAYERS} layers" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Layer breakdown" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$MANIFEST" | jq -r '.layers[] | "\(.size / 1024 / 1024 * 10 | floor / 10) MB \(.digest[7:19])"' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

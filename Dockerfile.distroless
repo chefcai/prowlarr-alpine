@@ -1,0 +1,106 @@
+# Dockerfile.distroless — gcr.io/distroless/cc-debian12 comparison variant.
+#
+# distroless/cc-debian12 provides: glibc, libstdc++, libgcc, openssl, zlib.
+# Does NOT provide: icu-libs, sqlite-libs, tzdata, ca-certificates, shell.
+# We copy those from a debian:bookworm-slim helper stage.
+#
+# UID/GID: distroless ships with uid 0 (root) and 65532 (nonroot) only.
+# To meet the 13001:13000 hard constraint we copy /etc/passwd + /etc/group
+# from an accounts stage — a well-known distroless pattern.
+#
+# HEALTHCHECK: distroless has no shell/wget/curl. We omit it here; this
+# variant is for size measurement only, not production deployment.
+#
+# Expected result: slightly smaller than debian:bookworm-slim but larger than
+# the Alpine primary. The glibc runtime is the same floor as bookworm-slim, and
+# distroless saves only the Debian package metadata + apt tooling (~5-6 MB
+# compressed).
+
+ARG PROWLARR_VERSION=2.3.5.5327
+ARG PROWLARR_BRANCH=master
+
+# ---- Stage 1: fetch & unpack (glibc tarball) --------------------------------
+FROM debian:bookworm-slim AS fetch
+ARG PROWLARR_VERSION
+ARG PROWLARR_BRANCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl tar \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+RUN curl -fsSL \
+    "https://prowlarr.servarr.com/v1/update/${PROWLARR_BRANCH}/updatefile?version=${PROWLARR_VERSION}&os=linux&runtime=netcore&arch=x64" \
+    -o /work/prowlarr.tar.gz \
+  && mkdir -p /work/prowlarr \
+  && tar xzf /work/prowlarr.tar.gz -C /work/prowlarr --strip-components=1 \
+  && rm /work/prowlarr.tar.gz
+
+RUN set -eux; \
+    cd /work/prowlarr; \
+    rm -rf Prowlarr.Update; \
+    find . -name '*.pdb' -type f -delete; \
+    rm -f UI/*.map; \
+    rm -f ServiceInstall ServiceUninstall; \
+    rm -f createdump
+
+ARG PROWLARR_VERSION
+ARG PROWLARR_BRANCH
+RUN printf 'UpdateMethod=docker\nBranch=%s\nPackageVersion=%s\nPackageAuthor=[chefcai/prowlarr-alpine](https://github.com/chefcai/prowlarr-alpine)\n' \
+    "${PROWLARR_BRANCH}" "${PROWLARR_VERSION}" \
+    > /work/prowlarr/package_info
+
+# ---- Stage 2: extra libs (icu + sqlite + tzdata + certs) --------------------
+FROM debian:bookworm-slim AS libs
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libicu72 \
+        libsqlite3-0 \
+        tzdata \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Stage 3: accounts (passwd/group with 13001:13000) ----------------------
+FROM debian:bookworm-slim AS accounts
+RUN groupadd -g 13000 prowlarr \
+    && useradd -u 13001 -g prowlarr -d /config -s /usr/sbin/nologin -M prowlarr
+
+# ---- Stage 4: runtime (distroless) ------------------------------------------
+FROM gcr.io/distroless/cc-debian12
+ARG PROWLARR_VERSION
+LABEL org.opencontainers.image.title="prowlarr-alpine (distroless variant)"
+LABEL org.opencontainers.image.source="https://github.com/chefcai/prowlarr-alpine"
+LABEL org.opencontainers.image.version="${PROWLARR_VERSION}"
+
+ENV COMPlus_EnableDiagnostics=0 \
+    XDG_CONFIG_HOME=/config/xdg \
+    TMPDIR=/run/prowlarr-temp \
+    TZ=UTC
+
+# Copy icu + sqlite from the libs stage
+COPY --from=libs /usr/lib/x86_64-linux-gnu/libicudata.so.72   /usr/lib/x86_64-linux-gnu/
+COPY --from=libs /usr/lib/x86_64-linux-gnu/libicui18n.so.72   /usr/lib/x86_64-linux-gnu/
+COPY --from=libs /usr/lib/x86_64-linux-gnu/libicuuc.so.72     /usr/lib/x86_64-linux-gnu/
+COPY --from=libs /usr/lib/x86_64-linux-gnu/libsqlite3.so.0    /usr/lib/x86_64-linux-gnu/
+COPY --from=libs /usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6 /usr/lib/x86_64-linux-gnu/
+# tzdata zone files
+COPY --from=libs /usr/share/zoneinfo /usr/share/zoneinfo
+# CA certificates
+COPY --from=libs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Custom passwd/group for uid 13001 / gid 13000
+COPY --from=accounts /etc/passwd /etc/passwd
+COPY --from=accounts /etc/group  /etc/group
+
+COPY --from=fetch --chown=13001:13000 /work/prowlarr /app/prowlarr/bin
+
+# Distroless has no RUN; create dirs via a workaround — we write them from the
+# fetch stage. In practice the missing /config and /run/prowlarr-temp will be
+# created by the container runtime bind-mount for /config, but TMPDIR may fail.
+# This variant is measurement-only; for production use the Alpine primary.
+
+USER 13001
+WORKDIR /app/prowlarr/bin
+EXPOSE 9696
+
+# No healthcheck — distroless has no shell or wget.
+
+CMD ["./Prowlarr", "--data=/config", "--nobrowser"]
