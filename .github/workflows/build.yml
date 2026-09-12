@@ -3,6 +3,8 @@ name: Build and Push prowlarr-alpine Image
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
     inputs:
       dockerfile:
@@ -181,7 +183,7 @@ jobs:
         with:
           context: .
           file: ./${{ steps.variant.outputs.dockerfile }}
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             PROWLARR_VERSION=${{ steps.prowlarr_version.outputs.version }}
@@ -192,7 +194,7 @@ jobs:
           cache-to:   type=gha,mode=max,scope=${{ steps.variant.outputs.dockerfile }}
 
       - name: Report final image size
-        if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
         run: |
           TAG="${{ steps.variant.outputs.version_tag }}"
           TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
