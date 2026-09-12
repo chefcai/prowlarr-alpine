@@ -2,7 +2,7 @@
 
 Footprint-minimized [Prowlarr](https://github.com/Prowlarr/Prowlarr) Docker image on Alpine Linux.
 
-Part of the [chefcai](https://github.com/chefcai) custom-image family for squirttle's 12 GB eMMC homelab:
+Part of the [chefcai](https://github.com/chefcai) custom-image family, designed for small/resource-constrained homelab hosts:
 `jellyfin-alpine` · `seerr-alpine` · `bazarr-alpine` · `sonarr-alpine` · **`prowlarr-alpine`**
 
 ---
@@ -33,7 +33,7 @@ prowlarr:
   init: true
   container_name: prowlarr
   environment:
-    - TZ=America/New_York
+    - TZ=UTC  # override to your local zone
   healthcheck:
     test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9696/ping"]
     interval: 1m30s
@@ -42,7 +42,7 @@ prowlarr:
   ports:
     - "9696:9696"
   volumes:
-    - /home/haadmin/config/prowlarr-config:/config
+    - /path/to/prowlarr-config:/config
     - /mnt/Media/config/prowlarr/Backups:/config/Backups
     - /mnt/Media/config/prowlarr/logs:/config/logs
   restart: unless-stopped
@@ -50,7 +50,8 @@ prowlarr:
 
 Key differences from the `linuxserver/prowlarr` block:
 - `init: true` — no s6-overlay; Docker provides PID 1
-- Drop `PUID` / `PGID` / `UMASK` env vars — UID 13001 / GID 13000 baked in
+- `PUID` / `PGID` env vars work directly (default 1000:1000 if unset);
+  drop `UMASK` -- still unsupported (LSIO-only)
 - Healthcheck uses `wget` (busybox, no curl in image) against `/ping` (no URL-base prefix)
 
 ---
@@ -94,7 +95,7 @@ Our image:
 - **Compressed:** **65.4 MB** (4 layers)
 - **On-disk:** **158 MB**
 - **vs iter-0:** **−16.5 % compressed, −18.1 % on-disk** ✅
-- **Deployed:** 2026-04-26 on squirttle. Smoke-tested: `/ping` returns `{"status":"OK"}`,
+- **Deployed:** 2026-04-26 in production. Smoke-tested: `/ping` returns `{"status":"OK"}`,
   container healthy in 40 s, 192.6 MB freed by removing LSIO image.
 
 ### iter-2 — debian:bookworm-slim + glibc ❌
@@ -136,7 +137,8 @@ Our image:
 - **Health endpoint:** `/ping` → `{"status":"OK"}` (HTTP 200 when fully started)
 - **Tarball URL:** `prowlarr.servarr.com/v1/update/master/updatefile?version={V}&os=linuxmusl&runtime=netcore&arch=x64`
 - **Required APKs (Alpine):** `icu-libs`, `sqlite-libs`, `tzdata`, `ca-certificates`
-- **UID/GID:** 13001:13000 (hardcoded, matches homelab convention)
+- **UID/GID:** 13001:13000 by default, fully overridable at runtime via
+  `PUID`/`PGID` (default 1000:1000 if unset)
 - **TMPDIR:** `/run/prowlarr-temp` (Prowlarr and Sentry write temp files here;
   created in Dockerfile and set via `ENV`)
 
@@ -184,9 +186,9 @@ stdout. Applies to all Servarr-family apps on .NET 6/8:
 
 ---
 
-## Squirttle deployment
+## Example deployment
 
-Replace the `prowlarr` service block in `~/arrs/docker-compose.yml`:
+Replace the `prowlarr` service block in your `docker-compose.yml`:
 
 ```yaml
 prowlarr:
@@ -202,7 +204,7 @@ prowlarr:
       max-size: "10m"
       max-file: "3"
   environment:
-    - TZ=America/New_York
+    - TZ=UTC  # override to your local zone
   healthcheck:
     # prowlarr-alpine uses busybox wget (no curl); /ping has no URL-base prefix
     test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9696/ping"]
@@ -212,7 +214,7 @@ prowlarr:
   ports:
     - "9696:9696"
   volumes:
-    - /home/haadmin/config/prowlarr-config:/config
+    - /path/to/prowlarr-config:/config
     - /mnt/Media/config/prowlarr/Backups:/config/Backups
     - /mnt/Media/config/prowlarr/logs:/config/logs
   restart: unless-stopped
