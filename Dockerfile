@@ -1,7 +1,7 @@
 # prowlarr-alpine — minimal Prowlarr (.NET 8 self-contained) image on Alpine.
 #
 # Pattern mirrors chefcai/sonarr-alpine, chefcai/jellyfin-alpine, chefcai/bazarr-alpine:
-# - Build runs in GitHub Actions, not on squirttle's eMMC.
+# - Build runs in GitHub Actions, not on the deploying host.
 # - Final image is plain alpine + only the runtime artifacts needed to launch Prowlarr.
 #
 # Prowlarr specifics:
@@ -15,7 +15,7 @@
 #     sqlite-libs   (native libsqlite3 — libe_sqlite3.so in the tarball P/Invokes
 #                    the system sqlite3; Prowlarr 2.3.5 added a fallback but the
 #                    system lib is still needed)
-#     tzdata        (TZ env support — squirttle uses America/New_York)
+#     tzdata        (TZ env support; defaults to UTC, override via the TZ env var)
 #     ca-certificates (HTTPS to indexers and Prowlarr's update-check endpoint)
 #
 # Compared to upstream linuxserver/prowlarr the savings come from:
@@ -47,7 +47,7 @@ RUN curl -fsSL \
   && tar xzf /work/prowlarr.tar.gz -C /work/prowlarr --strip-components=1 \
   && rm /work/prowlarr.tar.gz
 
-# Prune — every byte counts on squirttle's 12 GB eMMC.
+# Prune — every byte counts on storage-constrained hosts.
 #
 # SAFE prunes (verified class from sonarr-alpine + Prowlarr-specific inspection):
 # - Prowlarr.Update (~81 MB uncompressed): in-app updater bundling its own .NET
@@ -123,6 +123,7 @@ RUN apk add --no-cache \
         sqlite-libs \
         tzdata \
         ca-certificates \
+        su-exec \
     && addgroup -g 13000 prowlarr \
     && adduser -D -u 13001 -G prowlarr -h /config -s /sbin/nologin prowlarr \
     && mkdir -p /config /app /run/prowlarr-temp \
@@ -130,7 +131,12 @@ RUN apk add --no-cache \
 
 COPY --from=fetch --chown=prowlarr:prowlarr /work/prowlarr /app/prowlarr/bin
 
-USER prowlarr
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# NOTE: intentionally stays as root here -- entrypoint.sh drops to
+# PUID:PGID (default 1000:1000) via su-exec at container start. See
+# https://github.com/chefcai/prowlarr-alpine/issues/1
 WORKDIR /app/prowlarr/bin
 EXPOSE 9696
 
@@ -144,4 +150,5 @@ HEALTHCHECK --interval=1m30s --timeout=10s --retries=3 --start-period=60s \
 # --data  : per-instance config dir (SQLite DB, indexer configs, logs).
 # --nobrowser: suppresses the "open browser on startup" behaviour; no-op
 #              in Docker but signals intent.
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["./Prowlarr", "--data=/config", "--nobrowser"]
