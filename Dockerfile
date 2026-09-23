@@ -59,6 +59,18 @@ RUN curl -fsSL \
 # - ServiceInstall/ServiceUninstall (74 KB each): Windows service-installer ELF
 #   stubs. Not referenced by Prowlarr.deps.json on Linux.
 # - createdump (108 KB): .NET diagnostic core-dump utility. Not needed in Docker.
+# - libmsalruntime.so (~36 MB) + Microsoft.Identity.Client.Broker.dll +
+#   Microsoft.Identity.Client.Extensions.Msal.dll (new since the 2.3.5 baseline,
+#   pulled in transitively via Microsoft.Data.SqlClient's Azure AD auth support):
+#   MSAL's native "broker" (WAM on Windows, the Mac broker on macOS) for
+#   interactive/SSO sign-in flows. Prowlarr never initiates an interactive auth
+#   flow and the broker has no Linux implementation — MSAL.NET only P/Invokes
+#   libmsalruntime.so when a caller explicitly opts into
+#   WithBroker()/BrokerOptions, which Prowlarr's code never does. This is the
+#   single largest contributor to the 158 MB -> 198 MB growth between 2.3.5 and
+#   2.5.2. Verified with `docker history` + `du` on squirttle (HOMELAB-94)
+#   before pruning; re-verified end-to-end (/ping, indexer search, Sonarr/Radarr
+#   sync) on a squirttle eval container before this became the default.
 #
 # DO NOT prune (lessons from sonarr-alpine — same .NET framework, same SIGSEGV
 # risk for any DLL that appears Windows-only but is transitively resolved at
@@ -67,7 +79,8 @@ RUN curl -fsSL \
 # - Microsoft.AspNetCore.Server.HttpSys.dll, IIS*.dll
 # - Microsoft.VisualBasic*.dll, WindowsBase.dll, System.Windows*.dll
 # - System.ServiceProcess*.dll, System.Diagnostics.EventLog.dll
-# - Microsoft.Data.SqlClient.dll, Microsoft.Extensions.Hosting.WindowsServices.dll
+# - Microsoft.Data.SqlClient.dll, Microsoft.Identity.Client.dll,
+#   Microsoft.Extensions.Hosting.WindowsServices.dll
 # - Microsoft.Extensions.Logging.EventLog.dll
 RUN set -eux; \
     cd /work/prowlarr; \
@@ -75,7 +88,8 @@ RUN set -eux; \
     find . -name '*.pdb' -type f -delete; \
     rm -f UI/*.map; \
     rm -f ServiceInstall ServiceUninstall; \
-    rm -f createdump
+    rm -f createdump; \
+    rm -f libmsalruntime.so Microsoft.Identity.Client.Broker.dll Microsoft.Identity.Client.Extensions.Msal.dll
 
 # Write package_info so Prowlarr knows it's docker-managed and won't attempt
 # self-update (which would try to re-download Prowlarr.Update).
