@@ -29,8 +29,13 @@ on:
   schedule:
     # Daily at 07:30 UTC. Staggered after sonarr-alpine (07:00) in the suite:
     # bazarr 06:00 / jellyfin 06:15 / ttyd 06:30 / seerr 06:45 / sonarr 07:00
-    # prowlarr 07:30
+    # prowlarr 07:30. Checks whether a new Prowlarr version needs building.
     - cron: '30 7 * * *'
+    # Weekly periodic base refresh (Mondays 08:00 UTC): forces a rebuild of
+    # the current Prowlarr version even when its tag already exists, so
+    # alpine:3.21 apk security patches (icu-libs, sqlite-libs, ca-certificates,
+    # tzdata) land even during weeks with no upstream Prowlarr release.
+    - cron: '0 8 * * 1'
 
 env:
   REGISTRY: ghcr.io
@@ -100,16 +105,32 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve Prowlarr master version from prowlarr.servarr.com
         id: prowlarr_version
+        # prowlarr.servarr.com has intermittent 5xx (seen: HTTP 522 on the
+        # 2026-09-22 scheduled run). Retry with backoff instead of failing
+        # the whole run on a transient upstream blip.
         run: |
-          VERSION=$(curl -fsSL \
-            "https://prowlarr.servarr.com/v1/update/master/changes?os=linuxmusl&runtime=netcore&arch=x64" \
-            | jq -r '.[0].version')
+          URL="https://prowlarr.servarr.com/v1/update/master/changes?os=linuxmusl&runtime=netcore&arch=x64"
+          VERSION=""
+          for attempt in 1 2 3 4 5; do
+            RESPONSE=$(curl -fsSL -w '\n%{http_code}' "$URL" || echo "")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            if [ "$HTTP_CODE" = "200" ]; then
+              VERSION=$(echo "$BODY" | jq -r '.[0].version' 2>/dev/null || echo "")
+              if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+                break
+              fi
+            fi
+            echo "::warning::Attempt $attempt failed (HTTP ${HTTP_CODE:-none}); retrying..."
+            VERSION=""
+            sleep $((attempt * 10))
+          done
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "::error::Could not resolve Prowlarr master version"
+            echo "::error::Could not resolve Prowlarr master version after 5 attempts"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -121,23 +142,51 @@ jobs:
           DF="${{ inputs.dockerfile }}"
           [ -z "$DF" ] && DF="Dockerfile"
           SUFFIX="${{ inputs.tag_suffix }}"
+          IS_DEFAULT_BRANCH="false"
+          if [ "${{ github.ref_name }}" = "${{ github.event.repository.default_branch }}" ]; then
+            IS_DEFAULT_BRANCH="true"
+          fi
           # workflow_dispatch with a tag_suffix: publish only :<version>-<suffix>,
           # do NOT touch :latest — so iter-2/iter-3 measurements don't overwrite
           # the production tag.
+          #
+          # is_default_branch guard: :latest is updated ONLY when there is no
+          # tag_suffix AND the build is running off the default branch (push,
+          # schedule, or a workflow_dispatch explicitly targeting main). A
+          # workflow_dispatch on a feature branch with tag_suffix left blank
+          # used to silently overwrite :latest with an unreviewed build — that
+          # is what this guard closes.
           if [ -n "$SUFFIX" ]; then
             VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}-${SUFFIX}"
             UPDATE_LATEST="false"
-          else
+          elif [ "$IS_DEFAULT_BRANCH" = "true" ]; then
             VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}"
             UPDATE_LATEST="true"
+          else
+            VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}-${{ github.ref_name }}"
+            UPDATE_LATEST="false"
+            echo "::notice::Building off non-default branch '${{ github.ref_name }}' with no tag_suffix — publishing :$VERSION_TAG only, :latest is left untouched."
           fi
           echo "dockerfile=$DF"           >> "$GITHUB_OUTPUT"
           echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
           echo "update_latest=$UPDATE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "is_default_branch=$IS_DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Check if image already exists for this version+variant
         id: check
+        # The weekly base-refresh cron (0 8 * * 1) always rebuilds, even if
+        # this Prowlarr version's tag was already published this week, so
+        # alpine:3.21 apk security patches land on a regular cadence.
         run: |
+          IS_BASE_REFRESH="false"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "0 8 * * 1" ]; then
+            IS_BASE_REFRESH="true"
+          fi
+          if [ "$IS_BASE_REFRESH" = "true" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Weekly base-refresh run — forcing rebuild regardless of existing tag."
+            exit 0
+          fi
           TAG="${{ steps.variant.outputs.version_tag }}"
           TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" | jq -r .token)
           HTTP=$(curl -sSL -o /dev/null -w "%{http_code}" \
@@ -155,7 +204,7 @@ jobs:
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -174,12 +223,12 @@ jobs:
 
       - name: Set up Docker Buildx
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push Docker image
         if: github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true'
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./${{ steps.variant.outputs.dockerfile }}
@@ -192,6 +241,28 @@ jobs:
           # other's BuildKit cache.
           cache-from: type=gha,scope=${{ steps.variant.outputs.dockerfile }}
           cache-to:   type=gha,mode=max,scope=${{ steps.variant.outputs.dockerfile }}
+
+      - name: Smoke test — /ping on the pushed image
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.variant.outputs.version_tag }}"
+          echo "Smoke testing $TAG"
+          CID=$(docker run -d -p 9696:9696 "$TAG")
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          OK="false"
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:9696/ping" | grep -q '"OK"'; then
+              OK="true"
+              break
+            fi
+            sleep 2
+          done
+          if [ "$OK" != "true" ]; then
+            echo "::error::/ping did not return OK within 60s"
+            docker logs "$CID" || true
+            exit 1
+          fi
+          echo "::notice::/ping OK"
 
       - name: Report final image size
         if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.check.outputs.needs_build == 'true')
