@@ -146,6 +146,14 @@ jobs:
           if [ "${{ github.ref_name }}" = "${{ github.event.repository.default_branch }}" ]; then
             IS_DEFAULT_BRANCH="true"
           fi
+          # pull_request events set github.ref_name to a merge ref like
+          # "6/merge" (contains "/", not a valid Docker tag component).
+          # github.head_ref is only set on pull_request and holds the real
+          # source branch name — prefer it there. Then sanitize whatever we
+          # land on to Docker's allowed tag charset so a branch name with
+          # "/" or other odd characters can never produce an invalid tag.
+          RAW_BRANCH="${{ github.head_ref || github.ref_name }}"
+          SAFE_BRANCH=$(echo "$RAW_BRANCH" | tr -c 'A-Za-z0-9_.-' '-')
           # workflow_dispatch with a tag_suffix: publish only :<version>-<suffix>,
           # do NOT touch :latest — so iter-2/iter-3 measurements don't overwrite
           # the production tag.
@@ -155,7 +163,9 @@ jobs:
           # schedule, or a workflow_dispatch explicitly targeting main). A
           # workflow_dispatch on a feature branch with tag_suffix left blank
           # used to silently overwrite :latest with an unreviewed build — that
-          # is what this guard closes.
+          # is what this guard closes. pull_request builds never push anyway
+          # (see the build step's push: condition) but still need a
+          # syntactically valid local tag, which SAFE_BRANCH guarantees.
           if [ -n "$SUFFIX" ]; then
             VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}-${SUFFIX}"
             UPDATE_LATEST="false"
@@ -163,9 +173,9 @@ jobs:
             VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}"
             UPDATE_LATEST="true"
           else
-            VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}-${{ github.ref_name }}"
+            VERSION_TAG="${{ steps.prowlarr_version.outputs.version }}-${SAFE_BRANCH}"
             UPDATE_LATEST="false"
-            echo "::notice::Building off non-default branch '${{ github.ref_name }}' with no tag_suffix — publishing :$VERSION_TAG only, :latest is left untouched."
+            echo "::notice::Building off non-default branch '${RAW_BRANCH}' with no tag_suffix — publishing :$VERSION_TAG only, :latest is left untouched."
           fi
           echo "dockerfile=$DF"           >> "$GITHUB_OUTPUT"
           echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
